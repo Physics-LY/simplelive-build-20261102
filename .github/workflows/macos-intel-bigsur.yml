@@ -38,6 +38,7 @@ jobs:
           cache: true
       - name: Configure Intel Big Sur target and resolve locked dependencies
         run: |
+          python3 scripts/configure_flutter_bigsur.py
           flutter --version | tee -a out/toolchain.txt
           cp locks/simple_live_app.pubspec.lock source/simple_live_app/pubspec.lock
           python3 scripts/configure_macos.py source/simple_live_app
@@ -109,3 +110,4 @@ jobs:
           path: out/
           retention-days: 7
           if-no-files-found: error
+
