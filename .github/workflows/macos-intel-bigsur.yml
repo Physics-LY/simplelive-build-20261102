@@ -1,0 +1,111 @@
+name: SimpleLive Intel Big Sur build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      FLUTTER_XCODE_ARCHS: x86_64
+      FLUTTER_XCODE_EXCLUDED_ARCHS: arm64
+      FLUTTER_XCODE_ONLY_ACTIVE_ARCH: 'YES'
+      FLUTTER_XCODE_MACOSX_DEPLOYMENT_TARGET: '11.0'
+      FLUTTER_XCODE_CODE_SIGNING_ALLOWED: 'NO'
+      FLUTTER_XCODE_CODE_SIGNING_REQUIRED: 'NO'
+      FLUTTER_XCODE_CODE_SIGN_IDENTITY: ''
+      COCOAPODS_DISABLE_STATS: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: June6699/dart_simple_live
+          ref: 33b3f1ecbe2a3af7c79918b74b428d16d47884b3
+          path: source
+          persist-credentials: false
+      - name: Select Intel Xcode 16.4 and record tools
+        run: |
+          test "$(uname -m)" = x86_64
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          mkdir -p out
+          { date -u; uname -a; sw_vers; xcodebuild -version; clang --version; pod --version; git -C source rev-parse HEAD; } | tee out/toolchain.txt
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.9'
+          channel: stable
+          cache: true
+      - name: Configure Intel Big Sur target and resolve locked dependencies
+        run: |
+          flutter --version | tee -a out/toolchain.txt
+          cp locks/simple_live_app.pubspec.lock source/simple_live_app/pubspec.lock
+          python3 scripts/configure_macos.py source/simple_live_app
+          cd source/simple_live_app
+          flutter config --enable-macos-desktop --no-analytics
+          flutter pub get --enforce-lockfile
+          cp pubspec.lock ../../out/pubspec.lock
+      - name: Build macOS Release
+        working-directory: source/simple_live_app
+        run: |
+          set -o pipefail
+          flutter build macos --release --no-pub 2>&1 | tee ../../out/build-macos.log
+      - name: Thin embedded native binaries and validate every Mach-O
+        run: |
+          APP="source/simple_live_app/build/macos/Build/Products/Release/Simple Live.app"
+          test -d "$APP"
+          python3 - "$APP" <<'PY'
+          import pathlib,subprocess,sys
+          root=pathlib.Path(sys.argv[1])
+          for p in root.rglob('*'):
+              if p.is_symlink() or not p.is_file(): continue
+              with p.open('rb') as f: magic=f.read(4)
+              if magic not in [b'\xca\xfe\xba\xbe',b'\xca\xfe\xba\xbf']: continue
+              arches=subprocess.check_output(['lipo','-archs',str(p)],text=True).split()
+              if 'x86_64' not in arches: raise SystemExit(f'Missing Intel slice: {p}')
+              temp=str(p)+'.intel-tmp'
+              subprocess.run(['lipo',str(p),'-thin','x86_64','-output',temp],check=True)
+              pathlib.Path(temp).chmod(p.stat().st_mode)
+              pathlib.Path(temp).replace(p)
+              print('Thinned:',p)
+          PY
+          python3 scripts/audit_macho.py "$APP" --require-big-sur-intel > out/macos-native-compatibility.json
+          /usr/libexec/PlistBuddy -c 'Set :LSMinimumSystemVersion 11.0' "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - --entitlements source/simple_live_app/macos/Runner/Release.entitlements "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          plutil -p "$APP/Contents/Info.plist" | tee out/app-info.txt
+      - name: Smoke-test native multimedia and app launch
+        run: |
+          APP="$PWD/source/simple_live_app/build/macos/Build/Products/Release/Simple Live.app"
+          curl --fail --location --retry 3 https://flutter.github.io/assets-for-api-docs/assets/videos/butterfly.mp4 -o out/sample.mp4
+          MPV=$(find "$APP/Contents/Frameworks" -type f -name Mpv | head -n 1)
+          test -n "$MPV"
+          DYLD_FRAMEWORK_PATH="$APP/Contents/Frameworks" python3 scripts/native_mpv_smoke.py "$MPV" out/sample.mp4 | tee out/native-playback-test.txt
+          "$APP/Contents/MacOS/Simple Live" >out/app-launch.log 2>&1 &
+          APP_PID=$!
+          sleep 20
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo 'PASS: Release app stayed alive for 20 seconds on macOS 15 Intel (not a Big Sur runtime test).' | tee out/app-launch-test.txt
+            kill "$APP_PID"
+          else
+            cat out/app-launch.log
+            exit 1
+          fi
+      - name: Package Intel-only DMG and ZIP
+        run: |
+          APP="$PWD/source/simple_live_app/build/macos/Build/Products/Release/Simple Live.app"
+          NAME="SimpleLive-v1.13.3-macOS-x86_64-BigSur11-20261102"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "out/$NAME.zip"
+          mkdir -p dmg-root
+          ditto "$APP" 'dmg-root/Simple Live.app'
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname 'SimpleLive 1.13.3 Intel' -srcfolder dmg-root -ov -format UDZO "out/$NAME.dmg"
+          hdiutil verify "out/$NAME.dmg"
+          ls -lh out/*.zip out/*.dmg
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simplelive-macos-intel-bigsur
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
