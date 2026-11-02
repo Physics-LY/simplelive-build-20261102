@@ -1,0 +1,52 @@
+name: Test delivered Intel macOS package
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package-install:
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download already-built packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(uname -m)" = x86_64
+          mkdir -p artifact out
+          gh run download 41463335125 --repo "$GITHUB_REPOSITORY" --name simplelive-macos-intel-bigsur --dir artifact
+          { date -u; sw_vers; uname -m; } | tee out/package-test-system.txt
+      - name: Mount DMG and copy application to installation directory
+        run: |
+          MOUNT="$RUNNER_TEMP/simplelive-dmg"
+          INSTALL="$RUNNER_TEMP/simplelive-install"
+          mkdir -p "$MOUNT" "$INSTALL"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" artifact/*.dmg | tee out/dmg-mount.txt
+          test -L "$MOUNT/Applications"
+          ditto "$MOUNT/Simple Live.app" "$INSTALL/Simple Live.app"
+          hdiutil detach "$MOUNT"
+          APP="$INSTALL/Simple Live.app"
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tee out/installed-signature-test.txt
+          codesign -d --entitlements :- "$APP" > out/installed-entitlements.plist 2>out/codesign-details.txt
+          echo 'PASS: DMG mounted, application copied, DMG detached, installed ad-hoc signature verified.' | tee out/dmg-install-test.txt
+      - name: Launch installed app and test installed native player with external file
+        run: |
+          APP="$RUNNER_TEMP/simplelive-install/Simple Live.app"
+          cp artifact/sample.mp4 "$RUNNER_TEMP/simplelive-external-file.mp4"
+          MPV=$(find "$APP/Contents/Frameworks" -type f -name Mpv | head -n 1)
+          DYLD_FRAMEWORK_PATH="$APP/Contents/Frameworks" python3 scripts/native_mpv_smoke.py "$MPV" "$RUNNER_TEMP/simplelive-external-file.mp4" | tee out/installed-playback-test.txt
+          "$APP/Contents/MacOS/Simple Live" >out/installed-app-launch.log 2>&1 &
+          APP_PID=$!
+          sleep 20
+          if ! kill -0 "$APP_PID" 2>/dev/null; then cat out/installed-app-launch.log; exit 1; fi
+          echo 'PASS: installed Release application stayed alive for 20 seconds on macOS 15.7.9 Intel; no Big Sur runtime claim.' | tee out/installed-app-test.txt
+          screencapture -x out/installed-app-screen.png 2>out/screenshot-status.txt || true
+          kill "$APP_PID"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-package-install-test
+          path: out/
+          retention-days: 7
